@@ -29,6 +29,11 @@ from .diff_model_setting import initialize_distributed, load_config, setup_loggi
 from .transforms import SUPPORT_MODALITIES, define_fixed_intensity_transform
 from .utils import define_instance, dynamic_infer
 
+# Fixed acquisition-independent grid: 170 x 170 x 90 mm FOV over TARGET_DIM voxels.
+# TARGET_DIM must be divisible by 32 on every axis (VAE /4, then diffusion UNet /8).
+TARGET_DIM = (256, 256, 32)
+TARGET_SPACING = (170.0 / 256, 170.0 / 256, 90.0 / 32)
+
 
 def create_transforms(dim: tuple = None, modality: str = "unknown") -> Compose:
     """
@@ -57,11 +62,10 @@ def create_transforms(dim: tuple = None, modality: str = "unknown") -> Compose:
                 monai.transforms.EnsureChannelFirstd(keys="image"),
                 monai.transforms.Orientationd(keys="image", axcodes="RAS"),
                 monai.transforms.EnsureTyped(keys="image", dtype=torch.float32),
+                monai.transforms.Spacingd(keys="image", pixdim=TARGET_SPACING, mode="trilinear"),
+                monai.transforms.ResizeWithPadOrCropd(keys="image", spatial_size=dim),
             ]
             + intensity_transforms
-            + [
-                monai.transforms.Resized(keys="image", spatial_size=dim, mode="trilinear"),
-            ]
         )
     else:
         return Compose(
@@ -130,7 +134,7 @@ def process_file(
     """
     # Build output embedding filename alongside input stem; skip if it already exists.
     out_filename_base = filepath.replace(".gz", "").replace(".nii", "")
-    out_filename_base = os.path.join(args.embedding_base_dir, out_filename_base)
+    out_filename_base = os.path.join(args.embedding_base_dir, out_filename_base.lstrip("/"))
     out_filename = out_filename_base + "_emb.nii.gz"
 
     if os.path.isfile(out_filename):
@@ -139,17 +143,7 @@ def process_file(
     # Wrap input path into MONAI dict format.
     test_data = {"image": os.path.join(args.data_base_dir, filepath)}
 
-    # Apply baseline transforms to read metadata like dim/spacing from original.
-    transformed_data = plain_transforms(test_data)
-    nda = transformed_data["image"]
-
-    # Original volume size (dim) and spacing from nib/affine metadata.
-    dim = [int(nda.meta["dim"][_i]) for _i in range(1, 4)]
-    spacing = [float(nda.meta["pixdim"][_i]) for _i in range(1, 4)]
-
-    logger.info(f"old dim: {dim}, old spacing: {spacing}")
-
-    # Apply the full preprocessing (including resize if requested).
+    # Apply the full preprocessing (resample to TARGET_SPACING, crop/pad to TARGET_DIM).
     new_data = new_transforms(test_data)
     nda_image = new_data["image"]
 
@@ -243,14 +237,9 @@ def diff_model_create_training_data(env_config_path: str, model_config_path: str
         filepath = files_raw[_iter]["image"]
         modality = files_raw[_iter]["modality"]
 
-        # Compute rounded target dims (multiples of 128) from the original image metadata.
-        new_dim = tuple(
-            round_number(int(plain_transforms({"image": os.path.join(args.data_base_dir, filepath)})["image"].meta["dim"][_i])) for _i in range(1, 4)
-        )
+        # Fixed grid for every case: same voxel count, same spacing, same physical FOV.
+        new_dim = TARGET_DIM
 
-        # Build the transform pipeline that includes resizing to new_dim.
-        # NOTE: 'modality' is referenced here but not defined in this scope; caller must ensure it's available
-        # (or this line will raise a NameError). Left unchanged by request.
         logger.info(f"Generate embddings assuming the data is {modality}")
         new_transforms = create_transforms(new_dim, modality)
 
