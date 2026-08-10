@@ -86,43 +86,39 @@ def reduce_sum(value, device):
     return t.item()
 
 
-def _load_json_field(path, key, as_float=True):
-    with open(path) as f:
-        d = json.load(f)
-    return torch.FloatTensor(d[key]) if as_float else d[key]
-
-
-def build_transforms(modality_mapping):
+def build_transforms():
+    """Latents only. spacing and modality are constants here (see DiffusionTrainerDDP)."""
     return Compose(
         [
             monai.transforms.LoadImaged(keys=["image"]),
             monai.transforms.EnsureChannelFirstd(keys=["image"]),
-            monai.transforms.Lambdad(keys="spacing", func=lambda x: _load_json_field(x, "spacing")),
-            monai.transforms.Lambdad(keys="spacing", func=lambda x: x * 1e2),
-            monai.transforms.Lambdad(keys="modality", func=lambda x: modality_mapping[_load_json_field(x, "modality", False)]),
-            monai.transforms.EnsureTyped(keys=["modality"], dtype=torch.long),
         ]
     )
 
 
-def build_file_list(datalist_path, embedding_base_dir):
-    """dataset.json image paths -> the matching *_emb.nii.gz + sidecar json."""
-    with open(datalist_path) as f:
-        items = json.load(f)["training"]
+def build_file_list(datalist_path, embedding_base_dir, subdir, json_key):
+    """dataset json -> <embedding_base_dir>/<subdir>/<accession>/<stem>_emb.nii.gz
 
-    files, missing_emb, missing_json = [], 0, 0
+    The accession folder is the LAST directory of the original image path:
+      /mnt/.../FDZL/20260409/11193855_20200417_02200417199019/T2WI_AX_1.nii.gz
+                             ^^^^^^^^^^ accession ^^^^^^^^^^  ^^ stem ^^
+    """
+    with open(datalist_path) as f:
+        items = json.load(f)[json_key]
+
+    files, missing, tried = [], 0, []
     for item in items:
-        rel = item["image"].replace(".nii.gz", "_emb.nii.gz").lstrip("/")
-        emb = os.path.join(embedding_base_dir, rel)
-        if not os.path.exists(emb):
-            missing_emb += 1
-            continue
-        info = emb + ".json"
-        if not os.path.exists(info):
-            missing_json += 1
-            continue
-        files.append({"image": emb, "spacing": info, "modality": info})
-    return files, missing_emb, missing_json
+        src = item["image"]
+        accession = os.path.basename(os.path.dirname(src))
+        stem = os.path.basename(src).replace(".gz", "").replace(".nii", "")
+        emb = os.path.join(embedding_base_dir, subdir, accession, stem + "_emb.nii.gz")
+        if os.path.exists(emb):
+            files.append({"image": emb})
+        else:
+            missing += 1
+            if len(tried) < 5:
+                tried.append(emb)
+    return files, missing, tried
 
 
 class RankSliceSampler(Sampler):
@@ -172,8 +168,17 @@ class DiffusionTrainerDDP:
         self.ckpt_interval = self.train_cfg.get("ckpt_save_epoch_interval", 1)
         self.n_epochs = self.train_cfg["n_epochs"]
 
-        with open(args.modality_mapping_path) as f:
-            self.modality_mapping = json.load(f)
+        # Every latent was resampled to the same grid during extraction, so spacing is a
+        # constant, not per-case metadata; modality is a constant too (single-sequence
+        # dataset). No sidecar json is read anywhere.
+        infer_cfg = args.diffusion_unet_inference
+        self.spacing_tensor = (torch.tensor(infer_cfg["spacing"], dtype=torch.float32) * 1e2).to(self.device)
+        self.modality_code = int(infer_cfg["modality"])
+        if self.is_main:
+            self.logger.info(
+                f"[cond] spacing={infer_cfg['spacing']} (x100 -> {self.spacing_tensor.tolist()}) "
+                f"| modality={self.modality_code} -- must match what extraction used"
+            )
 
         self.noise_scheduler = define_instance(args, "noise_scheduler")
         assert isinstance(self.noise_scheduler, RFlowScheduler), "this trainer targets the rflow variant"
@@ -190,14 +195,23 @@ class DiffusionTrainerDDP:
 
     # ------------------------------------------------------------------ data
     def _build_data(self):
-        files, miss_emb, miss_json = build_file_list(self.args.json_data_list, self.args.embedding_base_dir)
+        files, missing, tried = build_file_list(
+            self.args.json_data_list,
+            self.args.embedding_base_dir,
+            getattr(self.args, "train_embedding_subdir", "train_data"),
+            getattr(self.args, "train_json_key", "training"),
+        )
         if not files:
-            raise RuntimeError(f"no usable embeddings under {self.args.embedding_base_dir}")
+            raise RuntimeError(
+                f"no embeddings resolved under {self.args.embedding_base_dir}. Tried e.g.:\n  " + "\n  ".join(tried)
+            )
         self.n_train = len(files)
         if self.is_main:
-            self.logger.info(f"[data] train {len(files)} usable | missing emb {miss_emb} | missing json {miss_json}")
+            self.logger.info(f"[data] train {len(files)} resolved | {missing} not found")
+            if missing:
+                self.logger.info(f"[data] first miss -> {tried[0]}")
 
-        ds = monai.data.Dataset(data=files, transform=build_transforms(self.modality_mapping))
+        ds = monai.data.Dataset(data=files, transform=build_transforms())
         bs = max(1, self.train_cfg["batch_size"] // self.world_size)
         nw = self.train_cfg.get("num_workers", 8)
         self.train_sampler = DistributedSampler(ds, self.world_size, self.local_rank, shuffle=True, drop_last=True)
@@ -221,17 +235,23 @@ class DiffusionTrainerDDP:
                 self.logger.info("[data] test_embedding_base_dir / test_json_data_list missing -> test disabled")
             return
 
-        files, miss_emb, miss_json = build_file_list(dl, base)
+        files, missing, tried = build_file_list(
+            dl, base,
+            getattr(self.args, "test_embedding_subdir", "test_data"),
+            getattr(self.args, "test_json_key", "testing"),
+        )
         cap = self.train_cfg.get("test_max_cases", 500)
         files = files[:cap]  # deterministic prefix: same cases every epoch
         if not files:
             if self.is_main:
                 self.logger.info("[data] test set empty -> test disabled")
+                if tried:
+                    self.logger.info(f"[data] tried e.g. {tried[0]}")
             return
 
         self.test_files = files
         self.n_test = len(files)
-        ds = monai.data.Dataset(data=files, transform=build_transforms(self.modality_mapping))
+        ds = monai.data.Dataset(data=files, transform=build_transforms())
         bs = max(1, self.train_cfg.get("test_batch_size", self.train_cfg["batch_size"]) // self.world_size)
         nw = self.train_cfg.get("num_workers", 8)
         self.test_loader = DataLoader(
@@ -240,7 +260,7 @@ class DiffusionTrainerDDP:
             pin_memory=True, prefetch_factor=4 if nw > 0 else None,
         )
         if self.is_main:
-            self.logger.info(f"[data] test {self.n_test} cases (cap {cap}) | missing emb {miss_emb} | missing json {miss_json}")
+            self.logger.info(f"[data] test {self.n_test} cases (cap {cap}) | {missing} not found")
 
     # ----------------------------------------------------------------- model
     def _build_model(self):
@@ -303,8 +323,9 @@ class DiffusionTrainerDDP:
     def _forward(self, batch, net, train_mode):
         """-> per-sample L1 (B,) and tau (B,) in [0,1], 0 = clean, 1 = pure noise."""
         z = batch["image"].to(self.device, non_blocking=True) * self.scale_factor
-        spacing = batch["spacing"].to(self.device)
-        modality = batch["modality"].to(self.device)
+        b = z.shape[0]
+        spacing = self.spacing_tensor[None].repeat(b, 1)
+        modality = torch.full((b,), self.modality_code, dtype=torch.long, device=self.device)
         if train_mode:
             modality = augment_modality_label(modality, prob=self.modality_dropout)
 
@@ -467,9 +488,8 @@ class DiffusionTrainerDDP:
         n_steps = self.train_cfg.get("img2img_num_inference_steps", 30)
         save_nifti = self.train_cfg.get("img2img_save_nifti", True)
         cfg_scale = self.args.diffusion_unet_inference.get("cfg_guidance_scale", 0.0)
-        modality_code = self.args.diffusion_unet_inference["modality"]
 
-        transform = build_transforms(self.modality_mapping)
+        transform = build_transforms()
         self.unet.eval()
         nii_dir = os.path.join(self.img_dir, f"epoch_{epoch:04d}")
         if save_nifti:
@@ -480,8 +500,8 @@ class DiffusionTrainerDDP:
             case_id = os.path.basename(case["image"]).replace("_emb.nii.gz", "")
             item = transform(dict(case))
             z = item["image"][None].to(self.device).float() * self.scale_factor
-            spacing = item["spacing"][None].to(self.device).float()
-            modality = torch.tensor([modality_code], dtype=torch.long, device=self.device)
+            spacing = self.spacing_tensor[None]
+            modality = torch.tensor([self.modality_code], dtype=torch.long, device=self.device)
 
             # Same gaussian for every tau of this case: the tau sweep is then a clean ablation.
             gen = torch.Generator().manual_seed(IMG2IMG_SEED + ci)
@@ -553,7 +573,7 @@ class DiffusionTrainerDDP:
     # --------------------------------------------------------- distribution
     def _real_latents(self, n):
         """First n real test latents, scaled the same way training scales them."""
-        transform = build_transforms(self.modality_mapping)
+        transform = build_transforms()
         out = [transform(dict(c))["image"][None].float() * float(self.scale_factor) for c in self.test_files[:n]]
         return torch.cat(out, dim=0)
 
@@ -601,13 +621,10 @@ class DiffusionTrainerDDP:
         batch = self.train_cfg.get("dist_batch_size", 8)
         n_steps = self.train_cfg.get("dist_num_inference_steps", 30)
         cfg_scale = self.args.diffusion_unet_inference.get("cfg_guidance_scale", 0.0)
-        modality_code = self.args.diffusion_unet_inference["modality"]
 
         self.unet.eval()
         real = self._real_latents(n_samples)
         shape = real.shape[1:]
-
-        spacing = torch.tensor(self.args.diffusion_unet_inference["spacing"], dtype=torch.float32) * 1e2
         gen_chunks = []
         for start in range(0, n_samples, batch):
             b = min(batch, n_samples - start)
@@ -617,8 +634,8 @@ class DiffusionTrainerDDP:
                 z=torch.zeros_like(noise),                       # tau0=1 -> z drops out entirely
                 noise=noise,
                 tau0=1.0,
-                spacing=spacing[None].repeat(b, 1).to(self.device),
-                modality=torch.full((b,), modality_code, dtype=torch.long, device=self.device),
+                spacing=self.spacing_tensor[None].repeat(b, 1),
+                modality=torch.full((b,), self.modality_code, dtype=torch.long, device=self.device),
                 n_steps=n_steps,
                 cfg_scale=cfg_scale,
             )

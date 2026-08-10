@@ -1,10 +1,15 @@
 {
     "data_base_dir": "./data",
-    "json_data_list": "./dataset_t2.json",
-    "embedding_base_dir": "/PATH/TO/embeddings",
 
-    "test_json_data_list": "./dataset_test.json",
-    "test_embedding_base_dir": "/PATH/TO/embeddings_test",
+    "json_data_list": "/PATH/TO/dataset_t2.json",
+    "embedding_base_dir": "/PATH/TO/embeddings",
+    "train_embedding_subdir": "train_data",
+    "train_json_key": "training",
+
+    "test_json_data_list": "/PATH/TO/dataset_t2_test.json",
+    "test_embedding_base_dir": "/PATH/TO/embeddings",
+    "test_embedding_subdir": "test_data",
+    "test_json_key": "testing",
 
     "train_log_path": "./logs_ft",
     "model_dir": "./models_ft",
@@ -12,7 +17,6 @@
 
     "trained_autoencoder_path": "models/autoencoder_v2.pt",
     "existing_ckpt_filepath": "./models/diff_unet_3d_rflow-mr.pt",
-    "modality_mapping_path": "./configs/modality_mapping.json",
 
     "output_dir": "./output",
     "output_prefix": "unet_3d"
