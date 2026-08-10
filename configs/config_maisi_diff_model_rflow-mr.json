@@ -1,36 +1,36 @@
 {
     "diffusion_unet_train": {
-        "batch_size": 1,
-        "cache_rate": 0,
+        "batch_size": 8,
         "lr": 0.00001,
-        "n_epochs": 1000
+        "n_epochs": 50,
+        "num_workers": 8,
+        "grad_clip_norm": 1.0,
+        "modality_dropout_prob": 0.1,
+        "if_resume": false,
+
+        "test_epoch_interval": 1,
+        "test_max_cases": 500,
+        "test_batch_size": 8,
+
+        "img2img_epoch_interval": 5,
+        "img2img_num_cases": 8,
+        "img2img_taus": [0.2, 0.35, 0.5],
+        "img2img_num_inference_steps": 30,
+        "img2img_save_nifti": true,
+
+        "dist_epoch_interval": 5,
+        "dist_num_samples": 128,
+        "dist_batch_size": 8,
+        "dist_num_inference_steps": 30,
+
+        "ckpt_save_epoch_interval": 1
     },
     "diffusion_unet_inference": {
-        "dim": [
-            128,
-            256,
-            256
-        ],
-        "spacing": [
-            1.25,
-            1.0,
-            1.0
-        ],
-        "top_region_index": [
-            0,
-            1,
-            0,
-            0
-        ],
-        "bottom_region_index": [
-            0,
-            0,
-            1,
-            0
-        ],
+        "dim": [256, 256, 32],
+        "spacing": [0.664, 0.664, 2.813],
         "random_seed": 0,
         "num_inference_steps": 30,
-        "modality": 9,
-        "cfg_guidance_scale": 15
+        "modality": 10,
+        "cfg_guidance_scale": 10
     }
 }

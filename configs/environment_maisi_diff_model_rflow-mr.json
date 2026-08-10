@@ -1,12 +1,19 @@
 {
     "data_base_dir": "./data",
-    "embedding_base_dir": "./embeddings",
-    "json_data_list": "./dataset.json",
-    "model_dir": "./models",
-    "model_filename": "diff_unet_3d_rflow-mr.pt",
-    "output_dir": "./output",
-    "output_prefix": "unet_3d",
+    "json_data_list": "./dataset_t2.json",
+    "embedding_base_dir": "/PATH/TO/embeddings",
+
+    "test_json_data_list": "./dataset_test.json",
+    "test_embedding_base_dir": "/PATH/TO/embeddings_test",
+
+    "train_log_path": "./logs_ft",
+    "model_dir": "./models_ft",
+    "model_filename": "diff_unet_rflow-mr_rectumT2_ft.pt",
+
     "trained_autoencoder_path": "models/autoencoder_v2.pt",
     "existing_ckpt_filepath": "./models/diff_unet_3d_rflow-mr.pt",
-    "modality_mapping_path": "./configs/modality_mapping.json"
+    "modality_mapping_path": "./configs/modality_mapping.json",
+
+    "output_dir": "./output",
+    "output_prefix": "unet_3d"
 }

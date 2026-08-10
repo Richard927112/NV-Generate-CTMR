@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 from monai.data import DataLoader
 from monai.inferers.inferer import SlidingWindowInferer
+from monai.metrics.fid import FIDMetric
 from monai.networks.schedulers import RFlowScheduler
 from monai.transforms import Compose
 from PIL import Image
@@ -46,13 +47,16 @@ TRAIN_LOG_HEADER = (
     ["epoch", "lr"]
     + [f"train_{k}" for k in LOSS_KEYS]
     + [f"test_{k}" for k in TEST_LOSS_KEYS]
-    + ["i2i_lat_rel", "i2i_mse", "i2i_psnr", "i2i_ssim", "n_train", "n_test"]
+    + ["i2i_lat_rel", "i2i_mse", "i2i_psnr", "i2i_ssim"]
+    + ["dist_fd", "dist_w1"]
+    + ["n_train", "n_test"]
 )
 IMG2IMG_HEADER = ["epoch", "case_id", "tau0", "lat_l2_rel", "mse", "psnr", "ssim"]
 
 # Fixed (t, eps) for the test split so the number is comparable across epochs.
 TEST_SEED = 20260101
 IMG2IMG_SEED = 20260202
+DIST_SEED = 20260303
 
 
 def append_csv(path, row, header):
@@ -164,6 +168,7 @@ class DiffusionTrainerDDP:
         self.modality_dropout = self.train_cfg.get("modality_dropout_prob", 0.1)
         self.test_interval = self.train_cfg.get("test_epoch_interval", 1)
         self.img2img_interval = self.train_cfg.get("img2img_epoch_interval", 5)
+        self.dist_interval = self.train_cfg.get("dist_epoch_interval", 5)
         self.ckpt_interval = self.train_cfg.get("ckpt_save_epoch_interval", 1)
         self.n_epochs = self.train_cfg["n_epochs"]
 
@@ -398,7 +403,12 @@ class DiffusionTrainerDDP:
 
     @torch.no_grad()
     def _denoise_from(self, z, noise, tau0, spacing, modality, n_steps, cfg_scale):
-        """Start at x = (1-tau0)*z + tau0*eps and integrate the ODE back to tau=0."""
+        """Start at x = (1-tau0)*z + tau0*eps and integrate the ODE back to tau=0.
+
+        tau0 = 1.0 gives x = eps, i.e. ordinary generation from pure noise.
+        Batch-safe: z may carry any batch size B.
+        """
+        batch = z.shape[0]
         t0 = tau0 * self.num_train_timesteps
         x = self.noise_scheduler.add_noise(
             original_samples=z, noise=noise, timesteps=torch.tensor([t0], device=self.device)
@@ -414,7 +424,7 @@ class DiffusionTrainerDDP:
             for t, next_t in zip(ts, next_ts):
                 inputs = {
                     "x": x,
-                    "timesteps": torch.Tensor((t,)).to(self.device),
+                    "timesteps": torch.full((batch,), float(t), device=self.device),
                     "spacing_tensor": spacing,
                     "class_labels": modality,
                 }
@@ -540,6 +550,105 @@ class DiffusionTrainerDDP:
         )
         return worst
 
+    # --------------------------------------------------------- distribution
+    def _real_latents(self, n):
+        """First n real test latents, scaled the same way training scales them."""
+        transform = build_transforms(self.modality_mapping)
+        out = [transform(dict(c))["image"][None].float() * float(self.scale_factor) for c in self.test_files[:n]]
+        return torch.cat(out, dim=0)
+
+    @staticmethod
+    def _pooled_features(latents):
+        """(N,C,D,H,W) -> (N, C*8): spatial average-pool to 2x2x2 then flatten.
+
+        Keeps the feature dim (32 for C=4) well below the sample count so the
+        covariance in the Frechet distance stays conditioned.
+        """
+        return torch.nn.functional.adaptive_avg_pool3d(latents, (2, 2, 2)).flatten(1)
+
+    @staticmethod
+    def _channel_w1(a, b, n_values=20000, seed=0):
+        """Mean per-channel 1-D Wasserstein distance between two sets of latents.
+
+        For equal-size samples W1 is just the mean absolute gap between the two
+        sorted value vectors, so no scipy and no histogram binning is needed.
+        """
+        g = torch.Generator().manual_seed(seed)
+        dists = []
+        for c in range(a.shape[1]):
+            va, vb = a[:, c].flatten(), b[:, c].flatten()
+            k = min(n_values, va.numel(), vb.numel())
+            ia = torch.randperm(va.numel(), generator=g)[:k]
+            ib = torch.randperm(vb.numel(), generator=g)[:k]
+            dists.append(float((va[ia].sort().values - vb[ib].sort().values).abs().mean()))
+        return float(np.mean(dists))
+
+    @torch.no_grad()
+    def dist_check(self, epoch):
+        """Generate N latents from pure noise and compare their distribution to the
+        real test latents.
+
+        NOT FID: a real FID needs an image-domain pretrained feature extractor. This
+        is a Frechet distance on pooled VAE-latent features plus a per-channel
+        Wasserstein-1. It is a failure detector (mode collapse, intensity drift,
+        noise-like output), not a quality score.
+        """
+        if not self.is_main or not self.test_files:
+            return None
+
+        n_samples = self.train_cfg.get("dist_num_samples", 128)
+        n_samples = min(n_samples, len(self.test_files))
+        batch = self.train_cfg.get("dist_batch_size", 8)
+        n_steps = self.train_cfg.get("dist_num_inference_steps", 30)
+        cfg_scale = self.args.diffusion_unet_inference.get("cfg_guidance_scale", 0.0)
+        modality_code = self.args.diffusion_unet_inference["modality"]
+
+        self.unet.eval()
+        real = self._real_latents(n_samples)
+        shape = real.shape[1:]
+
+        spacing = torch.tensor(self.args.diffusion_unet_inference["spacing"], dtype=torch.float32) * 1e2
+        gen_chunks = []
+        for start in range(0, n_samples, batch):
+            b = min(batch, n_samples - start)
+            g = torch.Generator().manual_seed(DIST_SEED + start)
+            noise = torch.randn((b, *shape), generator=g).to(self.device)
+            x = self._denoise_from(
+                z=torch.zeros_like(noise),                       # tau0=1 -> z drops out entirely
+                noise=noise,
+                tau0=1.0,
+                spacing=spacing[None].repeat(b, 1).to(self.device),
+                modality=torch.full((b,), modality_code, dtype=torch.long, device=self.device),
+                n_steps=n_steps,
+                cfg_scale=cfg_scale,
+            )
+            gen_chunks.append(x.float().cpu())
+        gen = torch.cat(gen_chunks, dim=0)
+
+        fd = float(FIDMetric()(self._pooled_features(gen), self._pooled_features(real)))
+        w1 = self._channel_w1(gen, real)
+        summary = {
+            "epoch": epoch,
+            "n_samples": n_samples,
+            "num_inference_steps": n_steps,
+            "cfg_guidance_scale": cfg_scale,
+            "latent_frechet_distance": fd,
+            "latent_channel_w1": w1,
+            "gen_mean_per_channel": gen.mean(dim=(0, 2, 3, 4)).tolist(),
+            "gen_std_per_channel": gen.std(dim=(0, 2, 3, 4)).tolist(),
+            "real_mean_per_channel": real.mean(dim=(0, 2, 3, 4)).tolist(),
+            "real_std_per_channel": real.std(dim=(0, 2, 3, 4)).tolist(),
+        }
+        with open(os.path.join(self.img_dir, f"dist_epoch_{epoch:04d}.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+
+        self.logger.info(
+            f"[dist] n={n_samples} | latent Frechet={fd:.4f} | channel W1={w1:.4f} | "
+            f"gen std={[round(v, 3) for v in summary['gen_std_per_channel']]} "
+            f"real std={[round(v, 3) for v in summary['real_std_per_channel']]}"
+        )
+        return {"fd": fd, "w1": w1}
+
     # ------------------------------------------------------------------ loop
     def save_checkpoint(self, epoch, train_loss):
         path = os.path.join(self.args.model_dir, self.args.model_filename)
@@ -565,10 +674,13 @@ class DiffusionTrainerDDP:
             do_test = (epoch % self.test_interval == 0) or (epoch == self.n_epochs - 1)
             te = self.test_epoch(epoch) if do_test else {k: -1.0 for k in TEST_LOSS_KEYS}
 
-            i2i = None
+            i2i, dst = None, None
             if (epoch % self.img2img_interval == 0) or (epoch == self.n_epochs - 1):
                 i2i = self.img2img(epoch)
+            if (epoch % self.dist_interval == 0) or (epoch == self.n_epochs - 1):
+                dst = self.dist_check(epoch)
             i2i = i2i or {"lat_l2_rel": -1.0, "mse": -1.0, "psnr": -1.0, "ssim": -1.0}
+            dst = dst or {"fd": -1.0, "w1": -1.0}
 
             if self.is_main:
                 lr = self.optimizer.param_groups[0]["lr"]
@@ -577,7 +689,8 @@ class DiffusionTrainerDDP:
                     [epoch, lr]
                     + [tr[k] for k in LOSS_KEYS]
                     + [te[k] for k in TEST_LOSS_KEYS]
-                    + [i2i["lat_l2_rel"], i2i["mse"], i2i["psnr"], i2i["ssim"], self.n_train, self.n_test],
+                    + [i2i["lat_l2_rel"], i2i["mse"], i2i["psnr"], i2i["ssim"]]
+                    + [dst["fd"], dst["w1"], self.n_train, self.n_test],
                     TRAIN_LOG_HEADER,
                 )
                 self.logger.info(
