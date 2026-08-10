@@ -16,6 +16,7 @@ import json
 import os
 
 import monai
+import nibabel as nib
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -23,6 +24,8 @@ from monai.data import DataLoader
 from monai.inferers.inferer import SlidingWindowInferer
 from monai.networks.schedulers import RFlowScheduler
 from monai.transforms import Compose
+from PIL import Image
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
@@ -40,8 +43,12 @@ from .utils_plot import get_xyz_plot
 LOSS_KEYS = ("l1", "l1_lo", "l1_mid", "l1_hi")
 TEST_LOSS_KEYS = ("l1", "l1_lo", "l1_mid", "l1_hi")
 TRAIN_LOG_HEADER = (
-    ["epoch", "lr"] + [f"train_{k}" for k in LOSS_KEYS] + [f"test_{k}" for k in TEST_LOSS_KEYS] + ["n_train", "n_test"]
+    ["epoch", "lr"]
+    + [f"train_{k}" for k in LOSS_KEYS]
+    + [f"test_{k}" for k in TEST_LOSS_KEYS]
+    + ["i2i_lat_rel", "i2i_mse", "i2i_psnr", "i2i_ssim", "n_train", "n_test"]
 )
+IMG2IMG_HEADER = ["epoch", "case_id", "tau0", "lat_l2_rel", "mse", "psnr", "ssim"]
 
 # Fixed (t, eps) for the test split so the number is comparable across epochs.
 TEST_SEED = 20260101
@@ -55,6 +62,17 @@ def append_csv(path, row, header):
         if not exists:
             w.writerow(header)
         w.writerow(row)
+
+
+def append_rows_csv(path, rows, header):
+    if not rows:
+        return
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(header)
+        w.writerows(rows)
 
 
 def reduce_sum(value, device):
@@ -133,6 +151,7 @@ class DiffusionTrainerDDP:
 
         self.log_dir = getattr(args, "train_log_path", os.path.join(args.model_dir, "logs"))
         self.train_log_csv = os.path.join(self.log_dir, "train_log.csv")
+        self.img2img_csv = os.path.join(self.log_dir, "img2img_metrics.csv")
         self.img_dir = os.path.join(self.log_dir, "img2img")
         if self.is_main:
             for d in (args.model_dir, self.log_dir, self.img_dir):
@@ -378,89 +397,148 @@ class DiffusionTrainerDDP:
         )
 
     @torch.no_grad()
+    def _denoise_from(self, z, noise, tau0, spacing, modality, n_steps, cfg_scale):
+        """Start at x = (1-tau0)*z + tau0*eps and integrate the ODE back to tau=0."""
+        t0 = tau0 * self.num_train_timesteps
+        x = self.noise_scheduler.add_noise(
+            original_samples=z, noise=noise, timesteps=torch.tensor([t0], device=self.device)
+        )
+        self.noise_scheduler.set_timesteps(
+            num_inference_steps=n_steps, input_img_size_numel=torch.prod(torch.tensor(z.shape[2:]))
+        )
+        ts = self.noise_scheduler.timesteps
+        ts = torch.cat((torch.tensor([t0], dtype=ts.dtype), ts[ts < t0]))
+        next_ts = torch.cat((ts[1:], torch.tensor([0], dtype=ts.dtype)))
+
+        with autocast("cuda", enabled=True):
+            for t, next_t in zip(ts, next_ts):
+                inputs = {
+                    "x": x,
+                    "timesteps": torch.Tensor((t,)).to(self.device),
+                    "spacing_tensor": spacing,
+                    "class_labels": modality,
+                }
+                if cfg_scale > 0:
+                    for k in inputs:
+                        if k == "class_labels":
+                            inputs[k] = torch.cat([inputs[k], torch.zeros_like(modality)])
+                        else:
+                            inputs[k] = torch.cat([inputs[k]] * 2)
+                    cond, uncond = self.unet_module(**inputs).chunk(2)
+                    v_hat = uncond + cfg_scale * (cond - uncond)
+                else:
+                    v_hat = self.unet_module(**inputs)
+                x, _ = self.noise_scheduler.step(v_hat, t, x, next_t)
+        return x
+
+    @staticmethod
+    def _montage(volume, lo, hi):
+        """(1,1,H,W,D) tensor -> uint8 3-view montage, windowed by the real volume's range."""
+        centers = [s // 2 for s in volume.shape[2:]]
+        img = get_xyz_plot(volume[0].float().cpu(), centers, mask_bool=False)
+        img = np.clip((img - lo) / max(hi - lo, 1e-6), 0, 1)
+        return (img * 255).astype(np.uint8)
+
+    @torch.no_grad()
     def img2img(self, epoch):
-        """Real latent -> noise to tau0 in (0, tau_max] -> integrate back -> decode.
-        The only view that puts a generated volume next to its real counterpart."""
+        """Real latent -> partial noise -> integrate back -> decode -> compare with the real one.
+
+        tau0 is a FIXED list, and the gaussian per case is seeded, so every epoch runs the
+        exact same experiment and the numbers form a curve. Higher psnr is NOT strictly
+        better: a model that returned the input untouched would score perfectly.
+        """
         if not self.is_main or not self.test_files:
-            return
+            return None
         if self.autoencoder is None:
             self._build_autoencoder()
 
         n_cases = self.train_cfg.get("img2img_num_cases", 8)
-        tau_max = self.train_cfg.get("img2img_tau_max", 0.5)
+        taus = self.train_cfg.get("img2img_taus", [0.2, 0.35, 0.5])
         n_steps = self.train_cfg.get("img2img_num_inference_steps", 30)
+        save_nifti = self.train_cfg.get("img2img_save_nifti", True)
         cfg_scale = self.args.diffusion_unet_inference.get("cfg_guidance_scale", 0.0)
         modality_code = self.args.diffusion_unet_inference["modality"]
 
         transform = build_transforms(self.modality_mapping)
         self.unet.eval()
-        gen = torch.Generator().manual_seed(IMG2IMG_SEED)
-        panels = []
+        nii_dir = os.path.join(self.img_dir, f"epoch_{epoch:04d}")
+        if save_nifti:
+            os.makedirs(nii_dir, exist_ok=True)
 
-        for case in self.test_files[:n_cases]:
+        rows, records, panels = [], [], []
+        for ci, case in enumerate(self.test_files[:n_cases]):
+            case_id = os.path.basename(case["image"]).replace("_emb.nii.gz", "")
             item = transform(dict(case))
             z = item["image"][None].to(self.device).float() * self.scale_factor
             spacing = item["spacing"][None].to(self.device).float()
             modality = torch.tensor([modality_code], dtype=torch.long, device=self.device)
 
-            tau0 = float(torch.rand(1, generator=gen)) * tau_max
-            t0 = tau0 * self.num_train_timesteps
+            # Same gaussian for every tau of this case: the tau sweep is then a clean ablation.
+            gen = torch.Generator().manual_seed(IMG2IMG_SEED + ci)
             noise = torch.randn(z.shape, generator=gen).to(self.device)
-            x = self.noise_scheduler.add_noise(
-                original_samples=z, noise=noise,
-                timesteps=torch.tensor([t0], device=self.device),
-            )
-
-            self.noise_scheduler.set_timesteps(
-                num_inference_steps=n_steps,
-                input_img_size_numel=torch.prod(torch.tensor(z.shape[2:])),
-            )
-            ts = self.noise_scheduler.timesteps
-            ts = torch.cat((torch.tensor([t0], dtype=ts.dtype), ts[ts < t0]))
-            next_ts = torch.cat((ts[1:], torch.tensor([0], dtype=ts.dtype)))
 
             with autocast("cuda", enabled=True):
-                for t, next_t in zip(ts, next_ts):
-                    inputs = {
-                        "x": x,
-                        "timesteps": torch.Tensor((t,)).to(self.device),
-                        "spacing_tensor": spacing,
-                        "class_labels": modality,
-                    }
-                    if cfg_scale > 0:
-                        for k in inputs:
-                            if k == "class_labels":
-                                inputs[k] = torch.cat([inputs[k], torch.zeros_like(modality)])
-                            else:
-                                inputs[k] = torch.cat([inputs[k]] * 2)
-                        cond, uncond = self.unet_module(**inputs).chunk(2)
-                        v_hat = uncond + cfg_scale * (cond - uncond)
-                    else:
-                        v_hat = self.unet_module(**inputs)
-                    x, _ = self.noise_scheduler.step(v_hat, t, x, next_t)
-
                 real = dynamic_infer(self.recon_inferer, self.recon_model, z)
-                fake = dynamic_infer(self.recon_inferer, self.recon_model, x)
+            real_np = real.squeeze().float().cpu().numpy()
+            lo, hi = float(np.percentile(real_np, 0.5)), float(np.percentile(real_np, 99.5))
+            data_range = float(real_np.max() - real_np.min())
+            row_imgs = [self._montage(real, lo, hi)]
 
-            centers = [s // 2 for s in real.shape[2:]]
-            pair = np.concatenate(
-                [
-                    get_xyz_plot(real[0].float().cpu(), centers, mask_bool=False),
-                    get_xyz_plot(fake[0].float().cpu(), centers, mask_bool=False),
-                ],
-                axis=0,
-            )
-            panels.append((pair, tau0))
+            if save_nifti:
+                affine = np.diag(list(self.args.diffusion_unet_inference["spacing"]) + [1.0])
+                nib.save(nib.Nifti1Image(real_np, affine), os.path.join(nii_dir, f"{case_id}_real.nii.gz"))
 
-        from PIL import Image
+            for tau0 in taus:
+                x = self._denoise_from(z, noise, float(tau0), spacing, modality, n_steps, cfg_scale)
+                with autocast("cuda", enabled=True):
+                    fake = dynamic_infer(self.recon_inferer, self.recon_model, x)
+                fake_np = fake.squeeze().float().cpu().numpy()
 
-        grid = np.concatenate([p for p, _ in panels], axis=1)
-        lo, hi = np.percentile(grid, 0.5), np.percentile(grid, 99.5)
-        grid = np.clip((grid - lo) / max(hi - lo, 1e-6), 0, 1)
-        out = os.path.join(self.img_dir, f"img2img_epoch_{epoch:04d}.png")
-        Image.fromarray((grid * 255).astype(np.uint8)).save(out)
-        taus = ", ".join(f"{t:.2f}" for _, t in panels)
-        self.logger.info(f"[img2img] saved {out} | top row = real, bottom row = regenerated | tau0 = [{taus}]")
+                lat_rel = float(torch.linalg.vector_norm(x - z) / torch.linalg.vector_norm(z))
+                mse = float(np.mean((real_np - fake_np) ** 2))
+                psnr = float(peak_signal_noise_ratio(real_np, fake_np, data_range=data_range))
+                ssim = float(structural_similarity(real_np, fake_np, data_range=data_range))
+
+                rows.append([epoch, case_id, round(float(tau0), 3), lat_rel, mse, psnr, ssim])
+                records.append(
+                    {"case_id": case_id, "tau0": float(tau0), "lat_l2_rel": lat_rel, "mse": mse, "psnr": psnr, "ssim": ssim}
+                )
+                row_imgs.append(self._montage(fake, lo, hi))
+                if save_nifti:
+                    nib.save(nib.Nifti1Image(fake_np, affine), os.path.join(nii_dir, f"{case_id}_tau{tau0:.2f}.nii.gz"))
+
+            panels.append(np.concatenate(row_imgs, axis=1))
+
+        # one PNG: rows = cases, columns = [real | tau_1 | tau_2 | ...]
+        png = os.path.join(self.img_dir, f"img2img_epoch_{epoch:04d}.png")
+        Image.fromarray(np.concatenate(panels, axis=0)).save(png)
+
+        append_rows_csv(self.img2img_csv, rows, IMG2IMG_HEADER)
+        summary = {
+            "epoch": epoch,
+            "taus": [float(t) for t in taus],
+            "num_cases": len(panels),
+            "num_inference_steps": n_steps,
+            "cfg_guidance_scale": cfg_scale,
+            "per_tau": {
+                f"{t:.2f}": {
+                    m: float(np.mean([r[m] for r in records if r["tau0"] == float(t)]))
+                    for m in ("lat_l2_rel", "mse", "psnr", "ssim")
+                }
+                for t in taus
+            },
+            "per_case": records,
+        }
+        with open(os.path.join(self.img_dir, f"img2img_epoch_{epoch:04d}.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+
+        worst = summary["per_tau"][f"{max(taus):.2f}"]
+        self.logger.info(
+            f"[img2img] {png} | columns = real, " + ", ".join(f"tau={t:.2f}" for t in taus) + " | "
+            f"at tau={max(taus):.2f}: lat_rel={worst['lat_l2_rel']:.4f} mse={worst['mse']:.5f} "
+            f"psnr={worst['psnr']:.2f} ssim={worst['ssim']:.4f}"
+        )
+        return worst
 
     # ------------------------------------------------------------------ loop
     def save_checkpoint(self, epoch, train_loss):
@@ -487,14 +565,19 @@ class DiffusionTrainerDDP:
             do_test = (epoch % self.test_interval == 0) or (epoch == self.n_epochs - 1)
             te = self.test_epoch(epoch) if do_test else {k: -1.0 for k in TEST_LOSS_KEYS}
 
+            i2i = None
             if (epoch % self.img2img_interval == 0) or (epoch == self.n_epochs - 1):
-                self.img2img(epoch)
+                i2i = self.img2img(epoch)
+            i2i = i2i or {"lat_l2_rel": -1.0, "mse": -1.0, "psnr": -1.0, "ssim": -1.0}
 
             if self.is_main:
                 lr = self.optimizer.param_groups[0]["lr"]
                 append_csv(
                     self.train_log_csv,
-                    [epoch, lr] + [tr[k] for k in LOSS_KEYS] + [te[k] for k in TEST_LOSS_KEYS] + [self.n_train, self.n_test],
+                    [epoch, lr]
+                    + [tr[k] for k in LOSS_KEYS]
+                    + [te[k] for k in TEST_LOSS_KEYS]
+                    + [i2i["lat_l2_rel"], i2i["mse"], i2i["psnr"], i2i["ssim"], self.n_train, self.n_test],
                     TRAIN_LOG_HEADER,
                 )
                 self.logger.info(
