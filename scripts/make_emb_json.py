@@ -13,7 +13,7 @@ import nibabel as nib
 
 parser = argparse.ArgumentParser(description="Write spacing/modality sidecars for MAISI embeddings")
 parser.add_argument("--embedding_base_dir", type=str, required=True)
-parser.add_argument("--modality", type=str, default="mri_t2", help="Key from configs/modality_mapping.json")
+parser.add_argument("--modality", type=str, default="mri_t2ax", help="Key from configs/modality_mapping.json")
 args = parser.parse_args()
 
 count = 0
